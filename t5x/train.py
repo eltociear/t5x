@@ -117,7 +117,8 @@ def train(
     run_eval_before_training: bool = False,
     train_state_initializer_cls: Type[
         utils.TrainStateInitializer] = utils.TrainStateInitializer,
-    use_gda: bool = True) -> Tuple[int, train_state_lib.TrainState]:
+    use_gda: bool = True,
+    use_orbax: bool = False) -> Tuple[int, train_state_lib.TrainState]:
   """Train function.
 
   Args:
@@ -173,6 +174,7 @@ def train(
     train_state_initializer_cls: t5x.utils.TrainStateInitializer class for
       initializing partitioned TrainState from checkpoints or scratch.
     use_gda: if True, uses GlobalDeviceArray. Experimental feature.
+    use_orbax: if True, uses Orbax for checkpointing. Experimental feature.
 
   Returns:
     The tuple of (last_step, last_train_state).
@@ -187,6 +189,8 @@ def train(
         '`use_gda=False` is deprecated and will be removed on Feb-01-23.'
         ' Please ensure that your workflow can use GDA.', DeprecationWarning)
   jax.config.update('jax_parallel_functions_output_gda', use_gda)
+  if use_orbax:
+    logging.info('Checkpointing with Orbax enabled.')
 
   # Each "epoch" of the training loop should be the min of the eval period,
   # checkpoint period or the full training.
@@ -338,21 +342,36 @@ def train(
       restore_cfgs)
   if len(restore_paths) > 1:
     raise ValueError('Multiple restore paths not permitted in training.')
-  checkpoint_manager = utils.LegacyCheckpointManager(
-      save_cfg=checkpoint_cfg.save,
-      restore_cfg=valid_restore_cfg,
-      train_state_shape=train_state_initializer.global_train_state_shape,
-      partitioner=partitioner,
-      ds_iter=train_iter,
-      model_dir=model_dir,
-      use_gda=use_gda)
 
-  train_state = checkpoint_manager.restore(
-      restore_paths, valid_restore_cfg,
-      utils.get_fallback_state(
-          valid_restore_cfg,
-          lambda rng: train_state_initializer.from_scratch(rng).state_dict(),
-          init_rng))
+  if use_orbax:
+    checkpoint_manager = utils.create_checkpoint_manager(
+        save_cfg=checkpoint_cfg.save,
+        restore_cfg=valid_restore_cfg,
+        train_state_shape=train_state_initializer.global_train_state_shape,
+        partitioner=partitioner,
+        ds_iter=train_iter,
+        model_dir=model_dir)
+    train_state = utils.restore(
+        checkpoint_manager, restore_paths, valid_restore_cfg,
+        utils.get_fallback_state(
+            valid_restore_cfg,
+            lambda rng: train_state_initializer.from_scratch(rng).state_dict(),
+            init_rng))
+  else:
+    checkpoint_manager = utils.LegacyCheckpointManager(
+        save_cfg=checkpoint_cfg.save,
+        restore_cfg=valid_restore_cfg,
+        train_state_shape=train_state_initializer.global_train_state_shape,
+        partitioner=partitioner,
+        ds_iter=train_iter,
+        model_dir=model_dir,
+        use_gda=use_gda)
+    train_state = checkpoint_manager.restore(
+        restore_paths, valid_restore_cfg,
+        utils.get_fallback_state(
+            valid_restore_cfg,
+            lambda rng: train_state_initializer.from_scratch(rng).state_dict(),
+            init_rng))
 
   # 3. If no checkpoint to restore, init from scratch.
   train_state = train_state or train_state_initializer.from_scratch(init_rng)
@@ -509,9 +528,10 @@ def train(
 
   # Save checkpoints before the training loop starts.
   if checkpoint_period:
-    logging.info('Saving checkpoint before the training loop starts.')
-    checkpoint_manager.save(trainer.train_state,
-                            checkpoint_cfg.save.state_transformation_fns)
+    if not use_orbax or (use_orbax and trainer.train_state.step
+                         not in checkpoint_manager.all_steps()):
+      checkpoint_manager.save(trainer.train_state,
+                              checkpoint_cfg.save.state_transformation_fns)
 
   # ----------------------------------------------------------------------------
   # Main training loop
