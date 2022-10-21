@@ -257,18 +257,15 @@ def train(
 
   train_iter = get_dataset_fn(train_dataset_cfg, ds_shard_id, num_ds_shards,
                               model.FEATURE_CONVERTER_CLS)
-  if isinstance(train_iter, tf.data.Dataset):
-    train_iter = clu.data.TfDatasetIterator(train_iter, checkpoint=True)
-  elif not isinstance(train_iter, clu.data.dataset_iterator.DatasetIterator):
-    raise ValueError(
-        f'get_dataset_fn returned unsupported type {type(train_iter)}.')
+  train_iter = utils.prepare_train_iter(
+      train_iter,
+      use_gda=use_gda,
+      partitioner=partitioner,
+      data_layout=data_layout)
 
   input_shapes = jax.tree_map(lambda x: (data_layout.batch_size, *x.shape[1:]),
                               train_iter.element_spec)
   input_types = jax.tree_map(lambda x: x.dtype, train_iter.element_spec)
-
-  if use_gda:
-    train_iter = utils.GDADatasetIterator(train_iter, partitioner, input_shapes)
 
   if train_eval_dataset_cfg:
     _verify_matching_vocabs(train_eval_dataset_cfg)
@@ -353,6 +350,10 @@ def train(
           valid_restore_cfg,
           lambda rng: train_state_initializer.from_scratch(rng).state_dict(),
           init_rng))
+
+  # Start warming up the input pipeline in the background. This must happen
+  # after input pipeline checkpoints were restored.
+  first_batch_ready = train_iter.peek_async()
 
   # 3. If no checkpoint to restore, init from scratch.
   train_state = train_state or train_state_initializer.from_scratch(init_rng)
@@ -512,6 +513,18 @@ def train(
     logging.info('Saving checkpoint before the training loop starts.')
     checkpoint_manager.save(trainer.train_state,
                             checkpoint_cfg.save.state_transformation_fns)
+  # ----------------------------------------------------------------------------
+  # Warmup input pipeline.
+  # ----------------------------------------------------------------------------
+  train_iter_warmup_tick = time.time()
+  # We are cheating here. The input pipeline already started warmup when
+  # first_batch_ready was created. The warmup was then interleaved with tel
+  # model initialization. We just measure the additional time needed.
+  first_batch_ready.result()
+  train_iter_warmup_tock = time.time()
+  train_metrics.write_scalar('timing/train_iter_warmup',
+                             train_iter_warmup_tock - train_iter_warmup_tick,
+                             host_step)
 
   # ----------------------------------------------------------------------------
   # Main training loop
