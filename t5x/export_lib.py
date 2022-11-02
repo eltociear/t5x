@@ -250,8 +250,16 @@ def create_inference_function(
 
     def predict_batch_with_aux(
         params: Mapping[str, Any],
-        batch: Mapping[str, jnp.ndarray]) -> Tuple[Any, Any]:
-      return model.predict_batch_with_aux(params, batch)
+        inputs: Mapping[str, jnp.ndarray]) -> Tuple[Any, Any]:
+      batch = dict(inputs)
+      kwargs = {}
+      try:
+        kwargs['decoder_params'] = batch.pop('decoder_params')
+      except KeyError:
+        pass
+      # pytype: disable=wrong-keyword-args
+      return model.predict_batch_with_aux(params, batch, **kwargs)
+      # pytype: enable=wrong-keyword-args
 
     predict_batch_with_aux = maybe_partition(predict_batch_with_aux)
 
@@ -727,6 +735,41 @@ def create_preprocessor_from_task(
           batch_size, task_feature_lengths, tokenized_inputs, input_tensor_name)
 
 
+def create_preprocessor_with_decoder_params(
+    batch_size: Optional[int],
+    output_features: Mapping[str, seqio.Feature],  # unused
+    task_feature_lengths: Mapping[str, int],
+    tokenized_inputs: bool,
+    *,
+    create_preprocessor_fn: CreatePreprocessorFn,
+    temperature_tensor_name: str = 'temperature',
+) -> Tuple[PreprocessorFn, Sequence[tf.TensorSpec]]:
+  """Creates a preprocessor and adds decoder params as inputs."""
+
+  # TODO(marcrasi): Delete after migrating clients.
+  if 'batch_size' in inspect.signature(create_preprocessor_fn).parameters:
+    # New signature.
+    preprocessor, input_signature = create_preprocessor_fn(
+        batch_size, output_features, task_feature_lengths,
+        tokenized_inputs)  # type: ignore
+  else:
+    # Old signature.
+    preprocessor = create_preprocessor_fn(output_features, task_feature_lengths,
+                                          tokenized_inputs)  # type: ignore
+    input_signature = create_single_tensor_input_signature(
+        batch_size, task_feature_lengths, tokenized_inputs)
+
+  def wrapped(*args: tf.Tensor) -> Mapping[str, tf.Tensor]:
+    *inputs, temperature = args
+    features = dict(preprocessor(*inputs))
+    features['decoder_params'] = {'temperature': temperature}
+    return features
+
+  input_signature = tuple(input_signature) + (tf.TensorSpec(
+      [batch_size], tf.float32, name=temperature_tensor_name),)
+  return wrapped, input_signature
+
+
 def _maybe_name_outputs(
     feature_values: Tuple[Any, ...], feature_names: Optional[List[str]]
 ) -> Union[Tuple[Any, ...], Mapping[str, Any]]:
@@ -790,7 +833,8 @@ def write_warmup_examples(text_batch: WarmupExamples,
                           output_dir: str,
                           model_name: str,
                           *,
-                          input_tensor_name: str = 'text_batch'):
+                          input_tensor_name: str = 'text_batch',
+                          temperature_tensor_name: Optional[str] = None):
   """Adds a single batch of Predict warmup data."""
   logging.info('Writing warmup data...')
   request = predict_pb2.PredictRequest()
@@ -802,6 +846,9 @@ def write_warmup_examples(text_batch: WarmupExamples,
     dtype = tf.int32
   request.inputs[input_tensor_name].CopyFrom(
       tf.make_tensor_proto(text_batch, dtype=dtype))
+  if temperature_tensor_name is not None:
+    request.inputs[temperature_tensor_name].CopyFrom(
+        tf.make_tensor_proto([1.0] * len(text_batch), dtype=tf.float32))
   assets_extra = os.path.join(output_dir, 'assets.extra')
   tf.io.gfile.makedirs(assets_extra)
   warmup_output = os.path.join(assets_extra, 'tf_serving_warmup_requests')
@@ -987,7 +1034,6 @@ def save(
       params=frozen_dict.unfreeze(params),
       batch_size=batch_size,
   )
-  print('input_signature', input_signature)
   signatures = {
       tf.saved_model.DEFAULT_SERVING_SIGNATURE_DEF_KEY:
           module.__call__.get_concrete_function(*input_signature)

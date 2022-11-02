@@ -509,7 +509,7 @@ def _temperature_sample_single_trial(
     if logit_callback_fn is not None:
       logits = logit_callback_fn(logits, state)
 
-    def sample_logits_with_nonzero_temperature(logits):
+    def sample_logits_with_nonzero_temperature(logits, temperature):
       scaled_logits = logits / jnp.maximum(temperature, MIN_TEMPERATURE)
       if topk:
         scaled_logits = binary_search.topk_mask(scaled_logits, topk, NEG_INF)
@@ -537,7 +537,7 @@ def _temperature_sample_single_trial(
 
       return (next_token, next_log_prob)
 
-    def sample_logits_with_zero_temperature(logits):
+    def sample_logits_with_zero_temperature(logits, temperature):  # pylint: disable=unused-argument
       # For zero temperature, we always want the greedy output, regardless
       # of the values of topk and topp.
 
@@ -555,10 +555,17 @@ def _temperature_sample_single_trial(
       return (next_token, next_log_prob)
 
     # Perform sampling with temperature
-    (next_token,
-     next_log_prob) = lax.cond(temperature > MIN_TEMPERATURE,
-                               sample_logits_with_nonzero_temperature,
-                               sample_logits_with_zero_temperature, logits)
+    if len(temperature.shape) == 1:
+      (next_token, next_log_prob) = jax.vmap(lambda l, t: lax.cond(  # pylint: disable=g-long-lambda
+          t > MIN_TEMPERATURE, sample_logits_with_nonzero_temperature,
+          sample_logits_with_zero_temperature, jnp.expand_dims(l, axis=0), t))(
+              logits, temperature)
+      next_token = jnp.squeeze(next_token, axis=-1)
+      next_log_prob = jnp.squeeze(next_log_prob, axis=-1)
+    else:
+      (next_token, next_log_prob) = lax.cond(
+          temperature > MIN_TEMPERATURE, sample_logits_with_nonzero_temperature,
+          sample_logits_with_zero_temperature, logits, temperature)
 
     # When different batch elements are at different points in the loop counter,
     # it is possible that an element that started at a higher index will reach
